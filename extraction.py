@@ -2,33 +2,54 @@
 extraction.py
 
 Runs the rolling character-sheet extraction over a list of book Units,
-in order, using the Gemini API (free tier). Each step feeds the model:
+in order, using IBM watsonx.ai (Granite). Each step feeds the model:
   - the character sheet as it stood after the previous unit
   - the raw text of the new unit
 ...and asks it to return an updated sheet, plus a short note on what
 changed. Results are cached to disk per-book/per-character so re-running
 the Streamlit app doesn't re-burn API calls.
 
-Requires: pip install google-genai
-Get a free key at https://aistudio.google.com/apikey (no card required).
+Requires: pip install ibm-watsonx-ai
+You'll need three things from IBM Cloud, all free on the Lite plan:
+  1. An IAM API key: https://cloud.ibm.com/iam/apikeys
+  2. A watsonx.ai project ID: create/open a project at https://dataplatform.cloud.ibm.com/wx,
+     then Project -> Manage -> General -> Details.
+  3. The region your project lives in (Dallas/us-south is the default for new
+     Lite-plan projects unless you picked something else at creation).
 """
 
 import json
 import time
 from pathlib import Path
 
-from google import genai
-from google.genai import types
-from google.genai import errors as genai_errors
+from ibm_watsonx_ai import Credentials
+from ibm_watsonx_ai.foundation_models import ModelInference
+from ibm_watsonx_ai.foundation_models.schema import TextChatParameters
+from ibm_watsonx_ai.wml_client_error import ApiRequestFailure
 
-# Free-tier model as of July 2026. Google renames/rotates which models sit on
-# the free tier fairly often (gemini-2.0-flash, the previous default here,
-# was shut down in June 2026) -- if this 404s or you get a "not found" error,
-# check https://aistudio.google.com for the current free Flash model name
-# and swap it in here. "gemini-flash-latest" is a self-updating alias Google
-# maintains specifically so code doesn't break every time they rotate models,
-# it's the safest default for exactly this reason.
-DEFAULT_MODEL = "gemini-flash-latest"
+# ibm/granite-3-3-8b-instruct is the current stable mid-size Granite instruct
+# model on watsonx.ai as of mid-2026 -- ibm/granite-4-h-small is newer and
+# worth trying too, but 3-3-8b has been out longer and is the safer default
+# for an extraction pipeline that needs to hold a JSON shape reliably across
+# 20+ chained calls. IBM does deprecate older Granite versions over time
+# (granite-3-8b-instruct, one generation back, already carries a deprecated
+# flag) -- if this 404s, check the current list with:
+#   api_client.foundation_models.ChatModels
+# or browse https://dataplatform.cloud.ibm.com/wx/samples for what's live
+# in your project's region, and swap the name in here or the sidebar field.
+DEFAULT_MODEL = "ibm/granite-3-3-8b-instruct"
+
+# watsonx.ai is regional -- your project lives in exactly one of these, and
+# calls have to go to the matching endpoint or you'll get a 404. Find yours
+# under Project -> Manage -> General -> Details -> "Region".
+WATSONX_REGIONS = {
+    "Dallas (us-south)": "https://us-south.ml.cloud.ibm.com",
+    "Frankfurt (eu-de)": "https://eu-de.ml.cloud.ibm.com",
+    "London (eu-gb)": "https://eu-gb.ml.cloud.ibm.com",
+    "Tokyo (jp-tok)": "https://jp-tok.ml.cloud.ibm.com",
+    "Toronto (ca-tor)": "https://ca-tor.ml.cloud.ibm.com",
+}
+DEFAULT_REGION = "Dallas (us-south)"
 
 EMPTY_SHEET = {
     "name": None,
@@ -88,8 +109,23 @@ Rules:
 """
 
 
-def get_client(api_key: str) -> genai.Client:
-    return genai.Client(api_key=api_key)
+def get_client(api_key: str, project_id: str, model_name: str = DEFAULT_MODEL, url: str = WATSONX_REGIONS[DEFAULT_REGION]) -> ModelInference:
+    credentials = Credentials(url=url, api_key=api_key)
+    params = TextChatParameters(
+        temperature=0.3,
+        max_completion_tokens=8000,
+        # Granite 3.3 supports native JSON-object mode through the chat API,
+        # same role response_mime_type played for Gemini. Kept alongside the
+        # prompt-level instruction and _strip_fences below as a second layer,
+        # since json_object mode still occasionally wraps output in fences.
+        response_format={"type": "json_object"},
+    )
+    return ModelInference(
+        model_id=model_name,
+        credentials=credentials,
+        project_id=project_id,
+        params=params,
+    )
 
 
 def build_prompt(character_name: str, previous_sheet: dict, unit_label: str, unit_text: str) -> str:
@@ -121,36 +157,36 @@ def _strip_fences(raw: str) -> str:
     return raw.strip()
 
 
-def call_gemini(client: genai.Client, prompt: str, model_name: str = DEFAULT_MODEL, max_retries: int = 5) -> dict:
+def call_watsonx(model: ModelInference, prompt: str, max_retries: int = 5) -> dict:
     delay = 2.0
     last_err = None
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.3,
-                ),
-            )
-            cleaned = _strip_fences(response.text)
+            response = model.chat(messages=[{"role": "user", "content": prompt}])
+            raw_text = response["choices"][0]["message"]["content"]
+            cleaned = _strip_fences(raw_text)
             return json.loads(cleaned)
-        except genai_errors.ClientError as e:
-            # 429 quota-exhausted is not transient within this session --
-            # free-tier daily quotas reset on a ~24h cycle, not within the
-            # few seconds our backoff waits, so retrying just wastes time.
-            # Surface it immediately instead of burning all 5 attempts.
-            if getattr(e, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e):
+        except ApiRequestFailure as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 403):
                 raise RuntimeError(
-                    "Gemini free-tier daily quota exhausted for this model. "
-                    "Retrying won't help today. Either switch to a different "
-                    "model in the sidebar (lighter models generally carry a "
-                    "higher daily cap) and hit Process/Resume again, or wait "
-                    "for the quota to reset -- everything processed so far is "
-                    "already cached, so resuming picks up right where this "
-                    "stopped."
+                    "watsonx.ai rejected the credentials (401/403). Regenerate "
+                    "the API key at https://cloud.ibm.com/iam/apikeys and make "
+                    "sure it belongs to the same IBM Cloud account as the "
+                    "project ID entered in the sidebar."
                 ) from e
+            if status == 404:
+                raise RuntimeError(
+                    "watsonx.ai returned 404 -- either the project ID is wrong "
+                    "(check Project -> Manage -> General -> Details) or the "
+                    "selected region doesn't match where that project actually "
+                    "lives, or the model isn't enabled in that region."
+                ) from e
+            # Unlike Gemini's hard daily free-tier quota, a watsonx.ai 429 is
+            # a rolling per-instance requests-per-second throttle (its docs
+            # cite ~30 RPS on typical instances) that clears within seconds,
+            # so backing off and retrying is the right move here, not failing
+            # fast the way the Gemini quota case did.
             last_err = e
             time.sleep(delay)
             delay *= 2
@@ -163,7 +199,7 @@ def call_gemini(client: genai.Client, prompt: str, model_name: str = DEFAULT_MOD
             # Other transient errors (5xx, network blips) -- back off and retry
             time.sleep(delay)
             delay *= 2
-    raise RuntimeError(f"Gemini call failed after {max_retries} attempts: {last_err}")
+    raise RuntimeError(f"watsonx.ai call failed after {max_retries} attempts: {last_err}")
 
 
 def cache_path_for(cache_dir: str, book_id: str, character_name: str) -> Path:
@@ -188,9 +224,11 @@ def process_book(
     units,
     character_name: str,
     api_key: str,
+    project_id: str,
     book_id: str = "book",
     cache_dir: str = "cache",
     model_name: str = DEFAULT_MODEL,
+    url: str = WATSONX_REGIONS[DEFAULT_REGION],
     progress_callback=None,
 ) -> list[dict]:
     """
@@ -205,12 +243,12 @@ def process_book(
     if start_index >= len(units):
         return snapshots  # already fully processed
 
-    client = get_client(api_key)
+    model = get_client(api_key, project_id, model_name, url)
     previous_sheet = snapshots[-1] if snapshots else dict(EMPTY_SHEET, name=character_name)
 
     for unit in units[start_index:]:
         prompt = build_prompt(character_name, previous_sheet, unit.label, unit.text)
-        updated = call_gemini(client, prompt, model_name=model_name)
+        updated = call_watsonx(model, prompt)
         snapshots.append(updated)
         previous_sheet = updated
         save_cache(cache_dir, book_id, character_name, snapshots)  # save as we go

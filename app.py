@@ -16,7 +16,7 @@ from pathlib import Path
 import streamlit as st
 
 from text_processing import load_book, strip_gutenberg_boilerplate, split_into_units
-from extraction import process_book, DEFAULT_MODEL
+from extraction import process_book, DEFAULT_MODEL, WATSONX_REGIONS, DEFAULT_REGION
 
 st.set_page_config(page_title="Character Snapshot", page_icon="🔖", layout="wide")
 
@@ -34,14 +34,27 @@ CONNOTATION_COLORS = {
 st.sidebar.title("Setup")
 
 api_key = st.sidebar.text_input(
-    "API key",
+    "IBM Cloud API key",
     type="password",
-    help="Free, no card required: https://aistudio.google.com/apikey",
+    help="Free on the Lite plan, no card required: https://cloud.ibm.com/iam/apikeys",
 )
+project_id = st.sidebar.text_input(
+    "watsonx.ai project ID",
+    help="From your project: Manage tab -> General -> Details. "
+         "Create a project at https://dataplatform.cloud.ibm.com/wx if you don't have one.",
+)
+region_label = st.sidebar.selectbox(
+    "Region",
+    options=list(WATSONX_REGIONS.keys()),
+    index=list(WATSONX_REGIONS.keys()).index(DEFAULT_REGION),
+    help="Must match the region your project was created in, or calls will 404.",
+)
+watsonx_url = WATSONX_REGIONS[region_label]
 model_name = st.sidebar.text_input(
     "Model name",
     value=DEFAULT_MODEL,
-    help="If this 404s, check aistudio.google.com for the current free Flash model name.",
+    help="If this 404s, the model may not be enabled in your project's region -- "
+         "check what's available under Project -> Manage -> Foundation models.",
 )
 
 st.sidebar.markdown("---")
@@ -73,7 +86,7 @@ character_name = st.sidebar.text_input(
     help='Try "the creature" or "Victor Frankenstein". Use whatever term you want as the anchor -- aliases get tracked automatically.',
 )
 
-process_clicked = st.sidebar.button("Process / Resume", type="primary", disabled=not (api_key and book_path))
+process_clicked = st.sidebar.button("Process / Resume", type="primary", disabled=not (api_key and project_id and book_path))
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -97,7 +110,7 @@ if book_path and st.session_state.units is None:
     cleaned = strip_gutenberg_boilerplate(raw)
     st.session_state.units = split_into_units(cleaned)
 
-if process_clicked and book_path and api_key and character_name:
+if process_clicked and book_path and api_key and project_id and character_name:
     progress_bar = st.progress(0.0)
     status = st.empty()
 
@@ -110,9 +123,11 @@ if process_clicked and book_path and api_key and character_name:
             st.session_state.units,
             character_name=character_name,
             api_key=api_key,
+            project_id=project_id,
             book_id=book_id,
             cache_dir="cache",
             model_name=model_name,
+            url=watsonx_url,
             progress_callback=on_progress,
         )
         st.session_state.snapshots = snapshots
